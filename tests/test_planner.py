@@ -236,6 +236,164 @@ def test_same_vehicle_ride_through_not_transfer(conn):
     assert jy["transfers"] == 0
 
 
+# --------------------------------------------------------------------------
+# 同线路同停站序列“后发先至”
+# --------------------------------------------------------------------------
+
+def _overtake_gtfs():
+    """T1 先发晚到、T2 后发先至（同 pattern S1,S2,S3）；
+    T3 08:25 自 S3 去 S5，仅 T2 可接续。"""
+    return {
+        "agency.txt": (
+            "agency_id,agency_name,agency_url,agency_timezone\n"
+            "A1,公交一公司,http://a,Asia/Shanghai\n"),
+        "stops.txt": (
+            "stop_id,stop_name\nS1,一号站\nS2,二号站\nS3,三号站\nS5,五号站\n"),
+        "routes.txt": (
+            "route_id,agency_id,route_short_name,route_long_name\n"
+            "R1,A1,1路,一号线\nR2,A1,2路,二号线\n"),
+        "trips.txt": (
+            "trip_id,route_id,service_id\n"
+            "T1,R1,SVC1\nT2,R1,SVC1\nT3,R2,SVC1\n"),
+        "calendar.txt": (
+            "service_id,monday,tuesday,wednesday,thursday,friday,saturday,"
+            "sunday,start_date,end_date\n"
+            "SVC1,1,1,1,1,1,1,1,20260101,20261231\n"),
+        "calendar_dates.txt": "",
+        "stop_times.txt": (
+            "trip_id,stop_sequence,stop_id,arrival_time,departure_time\n"
+            "T1,0,S1,08:00:00,08:00:00\n"
+            "T1,1,S2,08:10:00,08:10:00\n"
+            "T1,2,S3,09:00:00,09:00:00\n"
+            "T2,0,S1,08:05:00,08:05:00\n"
+            "T2,1,S2,08:15:00,08:15:00\n"
+            "T2,2,S3,08:20:00,08:20:00\n"
+            "T3,0,S3,08:25:00,08:25:00\n"
+            "T3,1,S5,08:40:00,08:40:00\n"),
+        "transfers.txt": (
+            "from_stop_id,to_stop_id,transfer_type,min_transfer_time\n"),
+    }
+
+
+def test_overtaking_later_trip_arrives_earlier(conn):
+    """同 pattern 后发先至：T2 08:05 发但 08:20 到 S3，必须进入结果；
+    只按最早发车/本站到达会漏报 T2。"""
+    import_gtfs_zip(conn, make_zip(_overtake_gtfs()))
+    r = plan_journey(conn, "S1", "S3", D, "08:00:00", max_transfers=0)
+    assert r["count"] == 1
+    jy = r["journeys"][0]
+    assert jy["transfers"] == 0
+    assert jy["legs"][0]["trip_id"] == "T2"
+    assert jy["legs"][0]["board_time"] == "2026-10-04 08:05:00"
+    assert jy["arrival_time"] == "2026-10-04 08:20:00"
+
+
+def test_overtaking_trip_can_continue_transfer(conn):
+    """T2 的 08:20 下车标号须进入换乘闭包并接续 T3（T1 09:00 赶不上）。"""
+    import_gtfs_zip(conn, make_zip(_overtake_gtfs()))
+    r = plan_journey(conn, "S1", "S5", D, "08:00:00", max_transfers=1)
+    chains = [tuple(l["trip_id"] for l in j["legs"]) for j in r["journeys"]]
+    assert ("T2", "T3") in chains
+    best = next(j for j in r["journeys"]
+                if [l["trip_id"] for l in j["legs"]] == ["T2", "T3"])
+    assert best["arrival_time"] == "2026-10-04 08:40:00"
+    assert best["legs"][0]["to_stop"] == "S3"
+    assert best["legs"][0]["alight_time"] == "2026-10-04 08:20:00"
+    assert best["legs"][1]["from_stop"] == "S3"
+    assert best["legs"][1]["board_time"] == "2026-10-04 08:25:00"
+
+
+def test_crossing_trips_both_needed_for_different_downstream(conn):
+    """T1 在 S2 更早（可接 S2 的 T3），T2 在 S3 更早（可接 S3 的 T4）：
+    剪枝必须覆盖各车后续站的到达与上车前驱，两车都不能被丢。"""
+    files = _overtake_gtfs()
+    files["stops.txt"] = (
+        "stop_id,stop_name\nS1,一号站\nS2,二号站\nS3,三号站\n"
+        "S4,四号站\nS5,五号站\n")
+    files["trips.txt"] = (
+        "trip_id,route_id,service_id\n"
+        "T1,R1,SVC1\nT2,R1,SVC1\nT3,R2,SVC1\nT4,R2,SVC1\n")
+    files["stop_times.txt"] = (
+        "trip_id,stop_sequence,stop_id,arrival_time,departure_time\n"
+        "T1,0,S1,08:00:00,08:00:00\n"
+        "T1,1,S2,08:10:00,08:10:00\n"
+        "T1,2,S3,09:00:00,09:00:00\n"
+        "T2,0,S1,08:05:00,08:05:00\n"
+        "T2,1,S2,08:15:00,08:15:00\n"
+        "T2,2,S3,08:20:00,08:20:00\n"
+        "T3,0,S2,08:12:00,08:12:00\nT3,1,S4,08:25:00,08:25:00\n"
+        "T4,0,S3,08:22:00,08:22:00\nT4,1,S5,08:40:00,08:40:00\n")
+    import_gtfs_zip(conn, make_zip(files))
+    r1 = plan_journey(conn, "S1", "S2", D, "08:00:00", max_transfers=0)
+    assert [l["trip_id"] for l in r1["journeys"][0]["legs"]] == ["T1"]
+    r2 = plan_journey(conn, "S1", "S3", D, "08:00:00", max_transfers=0)
+    assert [l["trip_id"] for l in r2["journeys"][0]["legs"]] == ["T2"]
+    r3 = plan_journey(conn, "S1", "S4", D, "08:00:00", max_transfers=1)
+    assert [l["trip_id"] for l in r3["journeys"][0]["legs"]] == ["T1", "T3"]
+    r4 = plan_journey(conn, "S1", "S5", D, "08:00:00", max_transfers=1)
+    assert [l["trip_id"] for l in r4["journeys"][0]["legs"]] == ["T2", "T4"]
+
+
+def test_non_overtaking_results_unchanged(conn):
+    """无反超时同 pattern 逐站只留最早可乘车，结果不应膨胀。"""
+    files = _overtake_gtfs()
+    files["stops.txt"] = "stop_id,stop_name\nS1,一号站\nS2,二号站\nS3,三号站\n"
+    files["routes.txt"] = (
+        "route_id,agency_id,route_short_name,route_long_name\n"
+        "R1,A1,1路,一号线\n")
+    files["trips.txt"] = (
+        "trip_id,route_id,service_id\nT1,R1,SVC1\nT2,R1,SVC1\n")
+    files["stop_times.txt"] = (
+        "trip_id,stop_sequence,stop_id,arrival_time,departure_time\n"
+        "T1,0,S1,08:00:00,08:00:00\nT1,1,S2,08:10:00,08:10:00\n"
+        "T1,2,S3,08:20:00,08:20:00\n"
+        "T2,0,S1,08:05:00,08:05:00\nT2,1,S2,08:15:00,08:15:00\n"
+        "T2,2,S3,08:25:00,08:25:00\n")
+    import_gtfs_zip(conn, make_zip(files))
+    r = plan_journey(conn, "S1", "S3", D, "08:00:00", max_transfers=0)
+    assert r["count"] == 1
+    assert r["journeys"][0]["legs"][0]["trip_id"] == "T1"
+    assert r["journeys"][0]["arrival_time"] == "2026-10-04 08:20:00"
+
+
+def test_overtaking_tie_smaller_trip_id(conn):
+    """后发先至同达场景的字典序决胜：同到达同换乘数取 trip_id 序列最小者。"""
+    files = _overtake_gtfs()
+    files["trips.txt"] = (
+        "trip_id,route_id,service_id\nT1,R1,SVC1\nT2,R1,SVC1\nT0,R1,SVC1\n")
+    files["stop_times.txt"] = (
+        "trip_id,stop_sequence,stop_id,arrival_time,departure_time\n"
+        "T1,0,S1,08:00:00,08:00:00\nT1,1,S2,08:10:00,08:10:00\n"
+        "T1,2,S3,09:00:00,09:00:00\n"
+        "T2,0,S1,08:05:00,08:05:00\nT2,1,S2,08:15:00,08:15:00\n"
+        "T2,2,S3,08:20:00,08:20:00\n"
+        "T0,0,S1,08:06:00,08:06:00\nT0,1,S2,08:16:00,08:16:00\n"
+        "T0,2,S3,08:20:00,08:20:00\n")
+    import_gtfs_zip(conn, make_zip(files))
+    r = plan_journey(conn, "S1", "S3", D, "08:00:00", max_transfers=0)
+    assert r["count"] == 1
+    assert r["journeys"][0]["legs"][0]["trip_id"] == "T0"
+
+
+def test_overtaking_same_instance_not_reboarded(conn):
+    """后发先至扫描中同车经停仍不计换乘：已在途实例不在本站重新上车。"""
+    files = _overtake_gtfs()
+    files["stops.txt"] = (
+        "stop_id,stop_name\nS1,一号站\nS2,二号站\nS3,三号站\n"
+        "S5,五号站\nSX,厅\n")
+    # S1 下车闭包经 0 秒边也能到 S2：S2 被标记，但 T2 不得在 S2 被回登
+    files["transfers.txt"] = (
+        "from_stop_id,to_stop_id,transfer_type,min_transfer_time\n"
+        "S1,SX,2,0\nSX,S2,2,0\n")
+    import_gtfs_zip(conn, make_zip(files))
+    r = plan_journey(conn, "S1", "S3", D, "08:00:00", max_transfers=1)
+    direct = [j for j in r["journeys"]
+              if [l["trip_id"] for l in j["legs"]] == ["T2"]]
+    assert direct and direct[0]["transfers"] == 0
+    assert len(direct[0]["legs"]) == 1
+    assert direct[0]["legs"][0]["from_stop"] == "S1"
+
+
 def test_zero_second_transfer_cycle_terminates(conn):
     """零秒换乘有向环不会导致死循环。"""
     files = base_gtfs()

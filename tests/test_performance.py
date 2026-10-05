@@ -90,3 +90,69 @@ def test_perf_100k_stop_times(tmp_path):
         assert len(r["journeys"]) <= 10, "结果不得超过 10 条（非支配集）"
         assert elapsed < 2.0, f"查询 {o}->{dst} 耗时 {elapsed:.3f}s 超过 2s"
     conn.close()
+
+
+def _build_overtaking_gtfs(n_stops: int = 100, n_trips: int = 1000,
+                           stops_per_trip: int = 100, seed: int = 11) -> bytes:
+    """10 万站时、全部车次同属一个 pattern 且相邻车次系统性“后发先至”：
+    站间间隔随机，后车常在前车之后发车却更早到达。迫使扫描并行保留多车，
+    无法靠发车/本站到达先后剪枝。"""
+    import io
+    import zipfile
+
+    rnd = random.Random(seed)
+    out = io.BytesIO()
+    with zipfile.ZipFile(out, "w") as zf:
+        zf.writestr("agency.txt",
+                    "agency_id,agency_name,agency_url,agency_timezone\n"
+                    "A1,公交公司,http://a,Asia/Shanghai\n")
+        stops = "\n".join(f"S{i:04d},站点{i}" for i in range(n_stops))
+        zf.writestr("stops.txt", "stop_id,stop_name\n" + stops + "\n")
+        zf.writestr("routes.txt",
+                    "route_id,agency_id,route_short_name,route_long_name\n"
+                    "R00,A1,反超线,反超线路\n")
+        zf.writestr("calendar.txt",
+                    "service_id,monday,tuesday,wednesday,thursday,friday,"
+                    "saturday,sunday,start_date,end_date\n"
+                    "SVC1,1,1,1,1,1,1,1,20260101,20261231\n")
+        trips = "\n".join(f"T{i:05d},R00,SVC1" for i in range(n_trips))
+        zf.writestr("trips.txt", "trip_id,route_id,service_id\n"
+                    + trips + "\n")
+        lines = []
+        for t in range(n_trips):
+            cur = 6 * 60 + rnd.randrange(0, 20 * 60)
+            for k in range(stops_per_trip):
+                hh, mm = divmod(cur, 60)
+                ts = f"{hh:02d}:{mm:02d}:00"
+                lines.append(f"T{t:05d},{k},S{k:04d},{ts},{ts}")
+                cur += rnd.choice([1, 2, 3, 4, 5, 6])
+        zf.writestr("stop_times.txt",
+                    "trip_id,stop_sequence,stop_id,arrival_time,"
+                    "departure_time\n" + "\n".join(lines) + "\n")
+        zf.writestr("transfers.txt",
+                    "from_stop_id,to_stop_id,transfer_type,min_transfer_time\n")
+    return out.getvalue()
+
+
+def test_perf_100k_full_overtaking(tmp_path):
+    """同 pattern 全面反超的 10 万站时线网：并行多车扫描仍须 < 2 秒。"""
+    payload = _build_overtaking_gtfs()
+    db = str(tmp_path / "perf_overtake.db")
+    conn = connect(db)
+    init_db(conn)
+    summary = import_gtfs_zip(conn, payload)
+    assert summary["stop_times"] >= 100_000
+
+    d = date(2026, 10, 4)
+    queries = [
+        ("S0000", "S0099", "08:00:00", 2),
+        ("S0000", "S0050", "07:00:00", 1),
+        ("S0020", "S0090", "09:00:00", 3),
+    ]
+    for o, dst, tm, mt in queries:
+        t = time.perf_counter()
+        r = plan_journey(conn, o, dst, d, tm, max_transfers=mt)
+        elapsed = time.perf_counter() - t
+        assert len(r["journeys"]) <= 10, "结果不得超过 10 条（非支配集）"
+        assert elapsed < 2.0, f"反超查询 {o}->{dst} 耗时 {elapsed:.3f}s 超过 2s"
+    conn.close()

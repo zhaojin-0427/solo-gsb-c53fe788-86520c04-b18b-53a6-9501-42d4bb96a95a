@@ -11,6 +11,13 @@
 - 同一辆车继续乘坐不计换乘（扫描中不回登同一 trip 实例）；
 - 步行边在每圈内做多源 Dijkstra 闭包，零秒环不会产生更优标号，自然终止。
 
+同 pattern 扫描允许“后发先至”：同一停站序列上的不同车次之间不保证
+单调（快车可超越慢车），因此圈内并行保留多个在途候选。候选 a 能否剪枝
+候选 b，要看 a 是否在 b 上车站之后的**每一个共同停靠站**都给出字典序
+不劣的标号 (到达, 段数, trip 序列)，即必须同时覆盖各车后续站的到达与
+上车前驱；只比较发车时刻或当前站的到达先后都会漏报反超车次。后缀支配
+信息（严格更晚/同达的最后位置）按实例对缓存，扫描为 O(候选数) 判定。
+
 结果在（到达时刻, 换乘次数）上保留非支配行程；
 同指标只留 trip_id 序列字典序最小者。
 """
@@ -66,8 +73,11 @@ class Pattern:
     route_id: str
     stops: list[str]
     pos: dict[str, int] = field(default_factory=dict)
-    # 每个停站位置：按 (发车绝对秒, 实例下标) 排序
-    index: list[list[tuple[int, int]]] = field(default_factory=list)
+    # 每个停站位置：按 (发车绝对秒, trip_id, 实例下标) 排序
+    index: list[list[tuple[int, str, int]]] = field(default_factory=list)
+    # 实例对后缀支配信息缓存（同 pattern 内的后发先至判定），见 _pair_info
+    pcache: dict[tuple[int, int], tuple[int, int, int]] = field(
+        default_factory=dict)
 
 
 def _active_services(conn, days: list[date]) -> dict[date, set[str]]:
@@ -97,6 +107,38 @@ def _active_services(conn, days: list[date]) -> dict[date, set[str]]:
                 active.discard(sid)  # 停运覆盖周历
         result[d] = active
     return result
+
+
+def _pair_info(pat: Pattern, instances, sa: int, sb: int):
+    """实例对的后缀支配原始信息（结果仅取决于站时，整次查询缓存）。
+
+    要求 sa < sb，返回 (last_late, last_e, last_early)：
+    - last_late：sa 到达严格更晚的最后位置；
+    - last_e：两者到达相同的最后位置；
+    - last_early：sa 到达严格更早的最后位置。
+    只考察两实例都停靠的位置；-1 表示不存在。调用方按自己关心的方向
+    取 last_late / last_early，再结合 (rides, seq) 判断同达站的字典序。
+    """
+    info = pat.pcache.get((sa, sb))
+    if info is not None:
+        return info
+    aa = instances[sa][4]
+    ab = instances[sb][4]
+    last_late = -1
+    last_e = -1
+    last_early = -1
+    for k, (x, y) in enumerate(zip(aa, ab)):
+        if x is None or y is None:
+            continue
+        if x > y:
+            last_late = k
+        elif x == y:
+            last_e = k
+        else:
+            last_early = k
+    info = (last_late, last_e, last_early)
+    pat.pcache[(sa, sb)] = info
+    return info
 
 
 def plan_journey(
@@ -354,12 +396,46 @@ def plan_journey(
 
         for pid in scanned:
             pat = patterns[pid]
-            # boarded = (实例下标, 上车站位置, 上车时刻, 上车所依标号, trip_id)
-            boarded = None
+            pcache = pat.pcache
+            # 并行在途候选（同一 pattern 可能存在“后发先至”，需同时保留
+            # 多辆车，任何一辆都不能仅凭发车或本站到达先后被剪枝）：
+            # (实例下标, 上车站位置, 上车时刻, 上车所依标号, trip_id)
+            boarded: list[tuple] = []
+            aboard: set[int] = set()  # boarded 中实例下标的镜像，O(1) 去重
+
+            def cover(ai, abp, aplab, bi, bbp, bplab) -> bool:
+                """a 是否已覆盖 b：a 上车不晚于 b，且在 b 之后所有共同停靠站
+                上 a 的字典序标号 (到达, 段数, trip 序列) 都不劣。
+
+                对“只看发车或本站到达先后”会误剪的反超车对，这里由后缀
+                全覆盖判定放行；后缀支配关系具传递性，可用于快速剪枝。"""
+                if abp > bbp:
+                    return False
+                sa, sb = (ai, bi) if ai < bi else (bi, ai)
+                info = pcache.get((sa, sb))
+                if info is None:
+                    last_late, last_e, last_early = _pair_info(
+                        pat, instances, sa, sb)
+                else:
+                    last_late, last_e, last_early = info
+                last_g = last_late if ai == sa else last_early
+                # b 之后只要有一站 a 严格晚到，a 就无法覆盖 b
+                if last_g > bbp:
+                    return False
+                if last_e > bbp:
+                    # 同达站还要比较段数与 trip 序列；候选标号的段数恒为
+                    # 前驱标号段数 +1，序列为前驱序列 + (trip_id,)
+                    if (aplab.rides + 1, aplab.seq + (instances[ai][0],)) > (
+                            bplab.rides + 1, bplab.seq + (instances[bi][0],)):
+                        return False
+                return True
+
             for j, sid in enumerate(pat.stops):
-                if boarded is not None:
-                    inst_idx, bp, bt, plab, trip_id = boarded
+                # 1) 先下车：每个在途候选向本站发射到达标号，只留字典序最优
+                for inst_idx, bp, bt, plab, trip_id in boarded:
                     arr_j = instances[inst_idx][4][j]
+                    if arr_j is None:
+                        continue
                     cand = Label(
                         stop=sid, arrival=arr_j, rides=plab.rides + 1,
                         kind="ride", parent=plab, trip_id=trip_id,
@@ -370,24 +446,39 @@ def plan_journey(
                     if old is None or cand.key() < old.key():
                         ride_here[sid] = cand
 
+                # 2) 再上车：本站为标记站时，枚举所有依前驱标号可乘的车，
+                #    交由后缀 Pareto 规则决定保留哪些（不能只取最早发车）
                 if sid in marked and sid in prev:
                     plab = prev[sid]
                     lst = pat.index[j]
-                    k = bisect_left(
-                        lst, (plab.arrival, "", -1))
-                    if k < len(lst):
-                        dep_j, cand_trip, inst_idx = lst[k]
-                        if boarded is None:
-                            boarded = (inst_idx, j, dep_j, plab, cand_trip)
-                        elif inst_idx != boarded[0]:
-                            # 不回登同一实例（同车经停不计换乘）；
-                            # 可换车的判定：本站发得更早，或同发时
-                            # 候选 trip_id 字典序更小（父标号同为上车点标号）。
-                            oi = boarded[0]
-                            if (dep_j, cand_trip) < (
-                                    instances[oi][5][j], boarded[4]):
-                                boarded = (inst_idx, j, dep_j, plab,
-                                           cand_trip)
+                    k = bisect_left(lst, (plab.arrival, "", -1))
+                    for dep_j, cand_trip, inst_idx in lst[k:]:
+                        # 同车经停不计换乘：不回登同一实例
+                        if inst_idx in aboard:
+                            continue
+                        # 快速拒绝：被现存任一候选覆盖即丢弃（覆盖关系
+                        # 可传递，逐个试探即可，多数候选在此出局）
+                        dominated = False
+                        for oi, obp, _obt, oplab, _otid in boarded:
+                            if cover(oi, obp, oplab,
+                                     inst_idx, j, plab):
+                                dominated = True
+                                break
+                        if dominated:
+                            continue
+                        # 新候选未被覆盖：剔除被它覆盖的旧候选
+                        kept = []
+                        for old in boarded:
+                            oi, obp, obt, oplab, otid = old
+                            if cover(inst_idx, j, plab,
+                                     oi, obp, oplab):
+                                aboard.discard(oi)
+                                continue
+                            kept.append(old)
+                        kept.append(
+                            (inst_idx, j, dep_j, plab, cand_trip))
+                        aboard.add(inst_idx)
+                        boarded = kept
 
         if not ride_here:
             break
