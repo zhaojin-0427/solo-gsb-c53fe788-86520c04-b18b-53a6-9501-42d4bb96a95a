@@ -11,6 +11,14 @@
 - 同一辆车继续乘坐不计换乘（扫描中不回登同一 trip 实例）；
 - 步行边在每圈内做多源 Dijkstra 闭包，零秒环不会产生更优标号，自然终止。
 
+同一线路同一停站序列（pattern）的不同班次可能“反超”（后发先到）：
+只跟踪每站最早发的一班会漏掉中途反超的班次。因此同一 pattern 内
+并行扫描多个班次实例，并按支配关系剪枝——班次 A 支配班次 B 当且仅当
+A 的上车前驱不差（rides 不更多、trip 序列不更大）且 A 在后续每一站
+的到达都不晚于 B；被支配者的后续标号不可能更优，可安全跳过/移除。
+该支配关系是预序（逐分量 <= 可传递），跳过与移除可任意次序进行；
+最坏情况（互不支配）全部保留，仍满足查询时限。
+
 结果在（到达时刻, 换乘次数）上保留非支配行程；
 同指标只留 trip_id 序列字典序最小者。
 """
@@ -21,6 +29,7 @@ from bisect import bisect_left
 from dataclasses import dataclass, field
 from datetime import date, datetime, timedelta
 from heapq import heappop, heappush
+from itertools import islice
 
 from .timeutils import fmt_local_dt, get_zone
 
@@ -66,8 +75,16 @@ class Pattern:
     route_id: str
     stops: list[str]
     pos: dict[str, int] = field(default_factory=dict)
-    # 每个停站位置：按 (发车绝对秒, 实例下标) 排序
-    index: list[list[tuple[int, int]]] = field(default_factory=list)
+    # 每个停站位置：按 (发车绝对秒, trip_id, 实例下标) 排序
+    index: list[list[tuple[float, str, int]]] = field(default_factory=list)
+
+
+def _suffix_le(arr_a: tuple, arr_b: tuple, j: int) -> bool:
+    """从位置 j 起 arr_a 逐站都不晚于 arr_b（班次支配判定的到达部分）。"""
+    for k in range(j, len(arr_a)):
+        if arr_a[k] > arr_b[k]:
+            return False
+    return True
 
 
 def _active_services(conn, days: list[date]) -> dict[date, set[str]]:
@@ -347,6 +364,7 @@ def plan_journey(
         marked = set(generated[rnd - 1].keys())
 
         ride_here: dict[str, Label] = {}
+        ride_best: dict[str, tuple] = {}  # sid -> ride_here[sid].key()
         scanned = {pid for s in marked
                    for pid, _ in stop_patterns.get(s, ())}
 
@@ -354,40 +372,66 @@ def plan_journey(
 
         for pid in scanned:
             pat = patterns[pid]
-            # boarded = (实例下标, 上车站位置, 上车时刻, 上车所依标号, trip_id)
-            boarded = None
+            # 并行在扫班次：同 pattern 内可能“反超”（后发先到），
+            # 只跟踪最早发的一班会漏报。active 元素：
+            # (实例下标, 上车位置, 上车时刻, 前驱标号, trip_id, rides, seq)
+            active: list[tuple] = []
+            active_inst: set[int] = set()
             for j, sid in enumerate(pat.stops):
-                if boarded is not None:
-                    inst_idx, bp, bt, plab, trip_id = boarded
-                    arr_j = instances[inst_idx][4][j]
-                    cand = Label(
-                        stop=sid, arrival=arr_j, rides=plab.rides + 1,
-                        kind="ride", parent=plab, trip_id=trip_id,
-                        trip_index=inst_idx, board_time=bt,
-                        alight_time=arr_j, from_stop=pat.stops[bp],
-                        to_stop=sid, seq=plab.seq + (trip_id,))
-                    old = ride_here.get(sid)
-                    if old is None or cand.key() < old.key():
-                        ride_here[sid] = cand
+                # 先下车：各在扫班次在本站的到达标号
+                if active:
+                    best = ride_best.get(sid)
+                    for (inst_idx, bp, bt, plab, trip_id,
+                         rides, seq) in active:
+                        arr_j = instances[inst_idx][4][j]
+                        ck = (arr_j, rides, seq)
+                        if best is None or ck < best:
+                            best = ck
+                            ride_here[sid] = Label(
+                                stop=sid, arrival=arr_j, rides=rides,
+                                kind="ride", parent=plab, trip_id=trip_id,
+                                trip_index=inst_idx, board_time=bt,
+                                alight_time=arr_j, from_stop=pat.stops[bp],
+                                to_stop=sid, seq=seq)
+                    ride_best[sid] = best
 
+                # 再上车：本站新可乘的班次，与在扫班次做支配剪枝
                 if sid in marked and sid in prev:
                     plab = prev[sid]
                     lst = pat.index[j]
-                    k = bisect_left(
-                        lst, (plab.arrival, "", -1))
-                    if k < len(lst):
-                        dep_j, cand_trip, inst_idx = lst[k]
-                        if boarded is None:
-                            boarded = (inst_idx, j, dep_j, plab, cand_trip)
-                        elif inst_idx != boarded[0]:
-                            # 不回登同一实例（同车经停不计换乘）；
-                            # 可换车的判定：本站发得更早，或同发时
-                            # 候选 trip_id 字典序更小（父标号同为上车点标号）。
-                            oi = boarded[0]
-                            if (dep_j, cand_trip) < (
-                                    instances[oi][5][j], boarded[4]):
-                                boarded = (inst_idx, j, dep_j, plab,
-                                           cand_trip)
+                    k = bisect_left(lst, (plab.arrival, "", -1))
+                    rides = plab.rides + 1
+                    for dep_j, cand_trip, inst_idx in islice(lst, k, None):
+                        if inst_idx in active_inst:
+                            continue  # 同车经停不回登同一实例
+                        seq = plab.seq + (cand_trip,)
+                        arr_c = instances[inst_idx][4]
+                        # 剪枝 1：某在扫班次的前驱不差（rides/seq 不更大）
+                        # 且后续各站到达都不晚 -> 候选的标号不可能更优。
+                        dominated = False
+                        for ent in active:
+                            if (ent[5] <= rides and ent[6] <= seq
+                                    and _suffix_le(instances[ent[0]][4],
+                                                   arr_c, j)):
+                                dominated = True
+                                break
+                        if dominated:
+                            continue
+                        # 剪枝 2：候选支配的在扫班次移出（其后续标号都被
+                        # 候选覆盖；已产生的下车标号不受影响）。
+                        if active:
+                            kept = []
+                            for ent in active:
+                                if (rides <= ent[5] and seq <= ent[6]
+                                        and _suffix_le(
+                                            arr_c, instances[ent[0]][4], j)):
+                                    active_inst.discard(ent[0])
+                                else:
+                                    kept.append(ent)
+                            active = kept
+                        active.append((inst_idx, j, dep_j, plab,
+                                       cand_trip, rides, seq))
+                        active_inst.add(inst_idx)
 
         if not ride_here:
             break

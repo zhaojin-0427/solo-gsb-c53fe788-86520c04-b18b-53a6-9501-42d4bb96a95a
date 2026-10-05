@@ -236,6 +236,114 @@ def test_same_vehicle_ride_through_not_transfer(conn):
     assert jy["transfers"] == 0
 
 
+# --------------------------------------------------------------------------
+# 同线路同停站序列（pattern）内的反超：后发先到
+# --------------------------------------------------------------------------
+
+def _overtaking_gtfs() -> dict[str, str]:
+    """同 pattern 三班：T2 中途反超 T1；T3 每站都不优于 T2（被支配）。"""
+    files = base_gtfs()
+    files["trips.txt"] = (
+        "trip_id,route_id,service_id\nT1,R1,SVC1\nT2,R1,SVC1\nT3,R1,SVC1\n")
+    files["stop_times.txt"] = (
+        "trip_id,stop_sequence,stop_id,arrival_time,departure_time\n"
+        "T1,0,S1,08:00:00,08:00:00\n"
+        "T1,1,S2,08:10:00,08:10:00\n"
+        "T1,2,S3,09:00:00,09:00:00\n"
+        # T2 发车更晚，但在 S2->S3 区间反超，08:20 先到 S3
+        "T2,0,S1,08:05:00,08:05:00\n"
+        "T2,1,S2,08:15:00,08:15:00\n"
+        "T2,2,S3,08:20:00,08:20:00\n"
+        # T3 在每一站都不优于 T2 -> 支配剪枝，不得影响结果
+        "T3,0,S1,08:06:00,08:06:00\n"
+        "T3,1,S2,08:16:00,08:16:00\n"
+        "T3,2,S3,08:21:00,08:21:00\n")
+    return files
+
+
+def test_overtaking_later_departure_earlier_arrival(conn):
+    """同线路同停站序列：后发班次反超先到，必须进入结果。"""
+    load(conn, **_overtaking_gtfs())
+    r = plan_journey(conn, "S1", "S3", D, "07:50:00", max_transfers=0)
+    assert r["count"] == 1
+    jy = r["journeys"][0]
+    assert jy["legs"][0]["trip_id"] == "T2"
+    assert jy["legs"][0]["board_time"] == "2026-10-04 08:05:00"
+    assert jy["arrival_time"] == "2026-10-04 08:20:00"
+
+
+def test_overtaking_each_trip_best_at_own_stop(conn):
+    """反超对各自在最优的站被采用：S2 取 T1（08:10），S3 取 T2（08:20）。"""
+    load(conn, **_overtaking_gtfs())
+    r2 = plan_journey(conn, "S1", "S2", D, "07:50:00", max_transfers=0)
+    assert r2["journeys"][0]["legs"][0]["trip_id"] == "T1"
+    assert r2["journeys"][0]["arrival_time"] == "2026-10-04 08:10:00"
+    r3 = plan_journey(conn, "S1", "S3", D, "07:50:00", max_transfers=0)
+    assert r3["journeys"][0]["legs"][0]["trip_id"] == "T2"
+    assert r3["journeys"][0]["arrival_time"] == "2026-10-04 08:20:00"
+
+
+def test_overtaking_arrival_continues_transfer(conn):
+    """反超班次的下车标号可接续换乘（T1 09:00 才到，赶不上 08:30 的车）。"""
+    files = _overtaking_gtfs()
+    files["trips.txt"] += "T9,R2,SVC1\n"
+    files["stop_times.txt"] += (
+        "T9,0,S3,08:30:00,08:30:00\n"
+        "T9,1,S5,08:50:00,08:50:00\n")
+    load(conn, **files)
+    r = plan_journey(conn, "S1", "S5", D, "07:50:00", max_transfers=1)
+    assert r["count"] == 1
+    jy = r["journeys"][0]
+    assert [l["trip_id"] for l in jy["legs"]] == ["T2", "T9"]
+    assert jy["transfers"] == 1
+    assert jy["legs"][1]["board_time"] == "2026-10-04 08:30:00"
+    assert jy["arrival_time"] == "2026-10-04 08:50:00"
+
+
+def test_overtaking_after_transfer_stop(conn):
+    """换乘后在中途站上车：同 pattern 反超对同样并行扫描。"""
+    files = base_gtfs()
+    files["trips.txt"] = (
+        "trip_id,route_id,service_id\nTA,R1,SVC1\nTB,R1,SVC1\nTC,R1,SVC1\n")
+    files["stop_times.txt"] = (
+        "trip_id,stop_sequence,stop_id,arrival_time,departure_time\n"
+        "TA,0,S1,08:00:00,08:00:00\n"
+        "TA,1,S2,08:30:00,08:30:00\n"
+        "TB,0,S2,08:40:00,08:40:00\n"
+        "TB,1,S3,08:50:00,08:50:00\n"
+        "TB,2,S4,09:40:00,09:40:00\n"
+        # TC 在 S2 发得更晚，但 S2->S4 反超，09:00 先到
+        "TC,0,S2,08:45:00,08:45:00\n"
+        "TC,1,S3,08:55:00,08:55:00\n"
+        "TC,2,S4,09:00:00,09:00:00\n")
+    load(conn, **files)
+    r = plan_journey(conn, "S1", "S4", D, "08:00:00", max_transfers=1)
+    assert r["count"] == 1
+    jy = r["journeys"][0]
+    assert [l["trip_id"] for l in jy["legs"]] == ["TA", "TC"]
+    assert jy["arrival_time"] == "2026-10-04 09:00:00"
+
+
+def test_same_pattern_strictly_worse_trip_pruned(conn):
+    """同 pattern 更晚且处处更慢的班次被剪枝，结果只留最早车。"""
+    files = base_gtfs()
+    files["trips.txt"] = "trip_id,route_id,service_id\nTA,R1,SVC1\nTB,R1,SVC1\n"
+    files["stop_times.txt"] = (
+        "trip_id,stop_sequence,stop_id,arrival_time,departure_time\n"
+        "TA,0,S1,08:00:00,08:00:00\n"
+        "TA,1,S2,08:10:00,08:10:00\n"
+        "TA,2,S3,08:30:00,08:30:00\n"
+        "TB,0,S1,08:05:00,08:05:00\n"
+        "TB,1,S2,08:15:00,08:15:00\n"
+        "TB,2,S3,08:35:00,08:35:00\n")
+    load(conn, **files)
+    r = plan_journey(conn, "S1", "S3", D, "07:50:00", max_transfers=0)
+    assert r["count"] == 1
+    assert r["journeys"][0]["legs"][0]["trip_id"] == "TA"
+    assert r["journeys"][0]["arrival_time"] == "2026-10-04 08:30:00"
+
+
+
 def test_zero_second_transfer_cycle_terminates(conn):
     """零秒换乘有向环不会导致死循环。"""
     files = base_gtfs()
