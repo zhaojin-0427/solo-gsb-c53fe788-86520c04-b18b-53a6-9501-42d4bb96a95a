@@ -1,0 +1,256 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>公交班次换乘查询台</title>
+<style>
+  :root { --bd:#d9dee7; --pri:#2563eb; --bg:#f5f7fb; }
+  * { box-sizing: border-box; }
+  body { margin:0; font-family: "Segoe UI","PingFang SC","Microsoft YaHei",sans-serif;
+         background:var(--bg); color:#1f2937; }
+  header { background:#1e3a8a; color:#fff; padding:16px 24px; }
+  header h1 { margin:0; font-size:20px; }
+  header p { margin:4px 0 0; font-size:13px; opacity:.85; }
+  main { max-width:980px; margin:20px auto; padding:0 16px; display:grid;
+         gap:20px; }
+  .card { background:#fff; border:1px solid var(--bd); border-radius:10px;
+          padding:18px 20px; }
+  .card h2 { margin:0 0 14px; font-size:16px; }
+  label { display:block; font-size:13px; color:#374151; margin:10px 0 4px; }
+  input, select, button { font:inherit; padding:8px 10px; border:1px solid var(--bd);
+          border-radius:6px; width:100%; }
+  input:focus, select:focus { outline:2px solid #93c5fd; border-color:var(--pri); }
+  .row { display:grid; grid-template-columns:1fr 1fr; gap:12px; }
+  .row3 { display:grid; grid-template-columns:1fr 1fr 120px; gap:12px; }
+  button { border:none; cursor:pointer; font-weight:600; margin-top:14px; }
+  .btn-pri { background:var(--pri); color:#fff; }
+  .btn-pri:disabled { opacity:.5; cursor:wait; }
+  .btn-up { background:#0f766e; color:#fff; }
+  table { border-collapse:collapse; width:100%; font-size:13px; margin-top:8px; }
+  th, td { border:1px solid var(--bd); padding:6px 8px; text-align:left; }
+  th { background:#eef2ff; }
+  .muted { color:#6b7280; font-size:12px; }
+  .ok { color:#047857; } .err { color:#b91c1c; }
+  .leg { border-left:3px solid var(--pri); padding:6px 10px; margin:6px 0;
+         background:#f8fafc; font-size:13px; }
+  .journey { border:1px solid var(--bd); border-radius:8px; padding:10px 12px;
+             margin:10px 0; }
+  .tag { display:inline-block; background:#dbeafe; color:#1e40af; border-radius:4px;
+         padding:1px 8px; font-size:12px; margin-right:6px; }
+  pre { white-space:pre-wrap; word-break:break-all; font-size:12px;
+        background:#f3f4f6; padding:8px; border-radius:6px; max-height:240px;
+        overflow:auto; }
+</style>
+</head>
+<body>
+<header>
+  <h1>公交班次换乘 Web 查询台</h1>
+  <p>上传 GTFS Schedule ZIP，按 agency 时区查询出发后 24 小时内的非支配行程</p>
+</header>
+<main>
+  <section class="card">
+    <h2>1. 导入时刻表（GTFS Schedule ZIP）</h2>
+    <input type="file" id="zipfile" accept=".zip">
+    <button class="btn-up" id="btnImport">上传并导入</button>
+    <p class="muted" id="importStatus">尚未导入。校验失败（缺引用、站时倒序等）会整包拒绝，旧数据仍可查询。</p>
+    <pre id="importDetail" hidden></pre>
+  </section>
+
+  <section class="card">
+    <h2>2. 查询换乘</h2>
+    <div class="row">
+      <div>
+        <label>运营方 agency</label>
+        <select id="agency"><option value="">（导入后自动加载）</option></select>
+      </div>
+      <div>
+        <label>最大换乘次数</label>
+        <input type="number" id="maxTransfers" value="2" min="0" max="16">
+      </div>
+    </div>
+    <div class="row">
+      <div>
+        <label>起点站（输入 ID / 名称后选择）</label>
+        <input list="stopList" id="origin" placeholder="stop_id 或站名">
+      </div>
+      <div>
+        <label>终到站</label>
+        <input list="stopList" id="dest" placeholder="stop_id 或站名">
+      </div>
+    </div>
+    <datalist id="stopList"></datalist>
+    <div class="row3">
+      <div>
+        <label>出发日期（agency 本地）</label>
+        <input type="date" id="date">
+      </div>
+      <div>
+        <label>出发时刻 HH:MM:SS</label>
+        <input type="time" id="time" step="1" value="08:00:00">
+      </div>
+      <div style="align-self:end">
+        <button class="btn-pri" id="btnSearch">搜索行程</button>
+      </div>
+    </div>
+    <p class="muted" id="searchMeta"></p>
+    <div id="results"></div>
+  </section>
+</main>
+
+<script>
+const $ = s => document.querySelector(s);
+const stopList = $('#stopList');
+
+function today() {
+  const d = new Date();
+  return d.toISOString().slice(0, 10);
+}
+$('#date').value = today();
+
+async function loadMeta() {
+  const r = await fetch('/api/meta');
+  const j = await r.json();
+  const sel = $('#agency');
+  sel.innerHTML = '';
+  (j.agencies || []).forEach((a, i) => {
+    const o = document.createElement('option');
+    o.value = a.agency_id;
+    o.textContent = `${a.agency_name}（${a.agency_id}，时区 ${a.agency_timezone}）`;
+    if (i === 0) o.selected = true;
+    sel.appendChild(o);
+  });
+  if (j.meta && j.meta.imported_at) {
+    $('#importStatus').innerHTML =
+      `<span class="ok">已导入：${j.meta.trips||0} 班次、` +
+      `${j.meta.stop_times||0} 条站时、${j.meta.stops||0} 站点</span>`;
+  }
+}
+
+async function loadStops() {
+  const r = await fetch('/api/stops?limit=100');
+  const j = await r.json();
+  stopList.innerHTML = '';
+  j.forEach(s => {
+    const o = document.createElement('option');
+    o.value = s.stop_id;
+    o.label = s.stop_name;
+    stopList.appendChild(o);
+  });
+}
+
+let stopCache = new Map();
+async function resolveStop(val) {
+  val = (val || '').trim();
+  if (!val) return null;
+  if (stopCache.has(val)) return stopCache.get(val);
+  const r = await fetch('/api/stops?q=' + encodeURIComponent(val) + '&limit=10');
+  const arr = await r.json();
+  // 输入的是完整 stop_id 优先
+  const exact = arr.find(s => s.stop_id === val);
+  const hit = exact || arr[0];
+  if (hit) stopCache.set(val, hit.stop_id);
+  return hit ? hit.stop_id : null;
+}
+
+$('#btnImport').onclick = async () => {
+  const f = $('#zipfile').files[0];
+  if (!f) { alert('请选择 ZIP 文件'); return; }
+  const fd = new FormData();
+  fd.append('file', f);
+  $('#btnImport').disabled = true;
+  $('#importStatus').textContent = '导入中…';
+  $('#importDetail').hidden = true;
+  try {
+    const r = await fetch('/api/import', { method: 'POST', body: fd });
+    const j = await r.json();
+    const box = $('#importDetail');
+    if (r.ok) {
+      $('#importStatus').innerHTML =
+        '<span class="ok">导入成功 ✔</span>';
+      box.textContent = JSON.stringify(j.summary, null, 2);
+      box.hidden = false;
+      await loadMeta(); await loadStops();
+    } else {
+      $('#importStatus').innerHTML =
+        `<span class="err">${j.detail || '导入被拒绝'}（HTTP ${r.status}），旧数据仍可查询</span>`;
+      box.textContent = (j.errors || []).join('\n');
+      box.hidden = false;
+    }
+  } catch (e) {
+    $('#importStatus').innerHTML = `<span class="err">请求失败：${e}</span>`;
+  } finally {
+    $('#btnImport').disabled = false;
+  }
+};
+
+$('#btnSearch').onclick = async () => {
+  const origin = await resolveStop($('#origin').value);
+  const destination = await resolveStop($('#dest').value);
+  if (!origin || !destination) { alert('请从候选列表中选择有效的起、终站'); return; }
+  const body = {
+    origin_id: origin,
+    destination_id: destination,
+    depart_date: $('#date').value,
+    depart_time: $('#time').value || '08:00:00',
+    max_transfers: parseInt($('#maxTransfers').value || '2', 10),
+    agency_id: $('#agency').value || null,
+  };
+  $('#btnSearch').disabled = true;
+  $('#results').innerHTML = '<p class="muted">查询中…</p>';
+  const t0 = performance.now();
+  try {
+    const r = await fetch('/api/journeys', {
+      method: 'POST', headers: {'Content-Type': 'application/json'},
+      body: JSON.stringify(body),
+    });
+    const j = await r.json();
+    const ms = Math.round(performance.now() - t0);
+    if (!r.ok) {
+      $('#results').innerHTML = `<p class="err">${j.detail || '查询失败'}</p>`;
+      return;
+    }
+    render(j, ms);
+  } catch (e) {
+    $('#results').innerHTML = `<p class="err">请求失败：${e}</p>`;
+  } finally {
+    $('#btnSearch').disabled = false;
+  }
+};
+
+function render(j, ms) {
+  $('#searchMeta').textContent =
+    `时区 ${j.timezone}｜搜索窗口 ${j.depart_after} → ${j.search_until}｜` +
+    `${j.count} 条非支配行程｜耗时 ${ms} ms`;
+  const box = $('#results');
+  if (!j.journeys.length) {
+    box.innerHTML = '<p class="muted">无可达行程（空列表）。</p>';
+    return;
+  }
+  box.innerHTML = '';
+  j.journeys.forEach((jy, i) => {
+    const div = document.createElement('div');
+    div.className = 'journey';
+    let html = `<div><span class="tag">方案 ${i+1}</span>` +
+      `<span class="tag">换乘 ${jy.transfers} 次</span>` +
+      `<span class="tag">到达 ${jy.arrival_time || '—'}</span></div>`;
+    if (!jy.legs.length) {
+      html += '<div class="leg">起终站相同：零段行程。</div>';
+    }
+    jy.legs.forEach(l => {
+      html += `<div class="leg">
+        <b>第 ${l.seq} 段 · 班次 ${l.trip_id}</b><br>
+        上车：${l.from_stop} @ <b>${l.board_time}</b><br>
+        下车：${l.to_stop} @ <b>${l.alight_time}</b>
+      </div>`;
+    });
+    div.innerHTML = html;
+    box.appendChild(div);
+  });
+}
+
+loadMeta().catch(() => {});
+loadStops().catch(() => {});
+</script>
+</body>
+</html>
